@@ -1,0 +1,93 @@
+name: Reusable - Terraform Apply
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      plan_only:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      TF_STATE_BUCKET:
+        required: true
+      TF_LOCK_TABLE:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform:
+    name: "Terraform ${{ inputs.plan_only && 'Plan' || 'Apply' }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform -chdir=infra fmt -check -recursive
+
+      - name: Terraform Init
+        run: |
+          terraform -chdir=infra init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ github.repository }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        run: terraform -chdir=infra validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          VAR_FILE=""
+          if [ -f "infra/inventories/${{ inputs.environment }}.tfvars" ]; then
+            VAR_FILE="-var-file=inventories/${{ inputs.environment }}.tfvars"
+          fi
+          terraform -chdir=infra plan -out=tfplan $VAR_FILE \
+            -var="environment=${{ inputs.environment }}" \
+            -var="aws_region=${{ inputs.aws_region }}"
+
+      - name: Comentar Plan no PR
+        if: ${{ inputs.plan_only && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### Terraform Plan — \`${{ inputs.environment }}\`
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            > Gerado automaticamente para o PR #${{ github.event.pull_request.number }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Terraform Apply
+        if: ${{ !inputs.plan_only }}
+        run: terraform -chdir=infra apply -auto-approve tfplan
