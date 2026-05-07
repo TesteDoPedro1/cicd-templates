@@ -1,0 +1,102 @@
+name: Reusable - Frontend Deploy
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      node_version:
+        required: false
+        type: string
+        default: "20"
+      build_command:
+        required: false
+        type: string
+        default: "npm run build"
+      build_dir:
+        required: false
+        type: string
+        default: "dist"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: "Frontend Deploy (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+          cache-dependency-path: "app/package-lock.json"
+
+      - name: Instalar dependências
+        run: npm ci
+        working-directory: app
+
+      - name: Build
+        run: ${{ inputs.build_command }}
+        working-directory: app
+
+      - name: Ler parâmetros SSM (bucket e distribuição CloudFront)
+        id: ssm
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
+          ENV="${{ inputs.environment }}"
+
+          BUCKET=$(aws ssm get-parameter \
+            --name "/${REPO_NAME}/${ENV}/s3_bucket_name" \
+            --query "Parameter.Value" --output text)
+
+          CF_ID=$(aws ssm get-parameter \
+            --name "/${REPO_NAME}/${ENV}/cloudfront_distribution_id" \
+            --query "Parameter.Value" --output text)
+
+          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "cf_id=${CF_ID}"   >> "$GITHUB_OUTPUT"
+
+      # HTML sem cache — garante que o index.html nunca fique obsoleto no browser
+      - name: Sincronizar arquivos HTML (no-cache)
+        run: |
+          aws s3 sync "${{ inputs.build_dir }}" "s3://${{ steps.ssm.outputs.bucket }}" \
+            --exclude "*" --include "*.html" \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --metadata-directive REPLACE
+        working-directory: app
+
+      # Assets (JS, CSS, imagens) com cache longo — hash no nome garante cache busting
+      - name: Sincronizar assets estáticos (cache imutável)
+        run: |
+          aws s3 sync "${{ inputs.build_dir }}" "s3://${{ steps.ssm.outputs.bucket }}" \
+            --exclude "*.html" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --delete
+        working-directory: app
+
+      - name: Invalidar cache CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.ssm.outputs.cf_id }}" \
+            --paths "/*"
