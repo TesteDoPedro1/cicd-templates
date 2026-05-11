@@ -35,6 +35,12 @@ on:
     secrets:
       AWS_ROLE_ARN:
         required: true
+      POSTHOG_KEY:
+        description: "PostHog project API key (NEXT_PUBLIC_POSTHOG_KEY). Deixe em branco para desativar analytics."
+        required: false
+      POSTHOG_HOST:
+        description: "Host do PostHog Cloud (ex: https://eu.i.posthog.com). Padrão: US Cloud."
+        required: false
 
 permissions:
   id-token: write
@@ -70,6 +76,11 @@ jobs:
       - name: Build
         run: ${{ inputs.build_command }}
         working-directory: app
+        env:
+          # NEXT_PUBLIC_* são embutidos no bundle em build-time pelo Next.js.
+          # Sem a chave o PostHogProvider carrega silenciosamente sem enviar eventos.
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
 
       - name: Ler parâmetros SSM
         id: ssm
